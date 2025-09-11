@@ -1,0 +1,186 @@
+library(Seurat)
+library(flowCore)
+library(dplyr)
+library(ggplot2)
+library(clustree)
+library(tidyr)
+
+set.seed(123) 
+fcs_dir <- "enter_path_to_your_fcs_files" 
+fcs_files <- list.files(fcs_dir, pattern = "\\.fcs$", full.names = TRUE)
+
+flow_list <- lapply(fcs_files, function(file_path) {
+  ff <- read.FCS(file_path, transformation = FALSE, truncate_max_range = FALSE)
+  num_events <- nrow(ff)
+  
+  # Downsample the file if total events are more than 5001
+  if (num_events > 5000) {
+    cat(paste("Downsampling:", basename(file_path), "from", num_events, "to 5000 events.\n"))
+    indices <- sample(1:num_events, 5000)
+    ff_sampled <- ff[indices, ]
+    return(ff_sampled)
+  } else {
+    cat(paste("Keeping all", num_events, "events from:", basename(file_path), ".\n"))
+    return(ff)
+  }
+})
+
+flow_set <- as(flow_list, "flowSet")
+sampleNames(flow_set) <- basename(fcs_files)
+expression_matrix <- fsApply(flow_set, exprs)
+
+metadata_df <- read.table("metadatafile.txt", header = TRUE) 
+sample_ids <- rep(sampleNames(flow_set), fsApply(flow_set, nrow))
+
+cell_metadata <- data.frame(FileName = sample_ids) %>%
+  left_join(metadata_df, by = "FileName")
+
+num_cells <- nrow(expression_matrix)
+cell_ids <- paste0("cell_", 1:num_cells)
+
+rownames(expression_matrix) <- cell_ids
+rownames(cell_metadata) <- cell_ids
+
+#Create Seurat Object
+cytof_seurat <- CreateSeuratObject(counts = t(expression_matrix), meta.data = cell_metadata)
+
+#Translate metal name to Molecule
+marker_map_file <- "markermolecule.txt, header =T" 
+marker_mapping <- read.table(marker_map_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+
+feature_rename_map <- setNames(marker_mapping$antigen, marker_mapping$fcs_colname)
+
+current_feature_names <- rownames(cytof_seurat)
+
+new_feature_names <- sapply(current_feature_names, function(name) {
+  if (name %in% names(feature_rename_map)) {
+    return(feature_rename_map[[name]])
+  } else {
+    return(name)
+  }
+}, USE.NAMES = FALSE)
+
+rownames(cytof_seurat[["RNA"]]) <- new_feature_names
+
+
+# Arcsinh transformation
+cofactor <- 5
+cytof_seurat@assays$RNA$data <- asinh(cytof_seurat@assays$RNA$counts / cofactor)
+#Scaling
+all_markers <- rownames(cytof_seurat)
+cytof_seurat <- ScaleData(cytof_seurat, features = all_markers)
+
+# PCA
+cytof_seurat <- RunPCA(
+  cytof_seurat,
+  features = all_markers,
+  npcs = length(all_markers), 
+  approx = FALSE,             
+  verbose = FALSE
+)
+# Harmony correction
+pca_embeddings <- Embeddings(cytof_seurat, "pca")
+meta_data <- cytof_seurat@meta.data
+
+harmony_embeddings <- harmony::RunHarmony(
+  data_mat = pca_embeddings,
+  meta_data = meta_data,
+  vars_use = "PatientID" # バッチ補正に使う変数
+)
+
+rownames(harmony_embeddings) <- rownames(pca_embeddings) 
+cytof_seurat[["harmony"]] <- CreateDimReducObject(
+  embeddings = harmony_embeddings, 
+  key = "harmony_", 
+  assay = "RNA"
+)
+
+# UMAP
+cytof_seurat <- RunUMAP(cytof_seurat, reduction = "harmony", dims = 1:15)
+
+#Clustering
+cytof_seurat <- FindNeighbors(cytof_seurat, reduction = "harmony", dims = 1:15)
+res=seq(0,1,0.1)
+for (i in 1:length(res)){cytof_seurat <- FindClusters(cytof_seurat, resolution = res[i])}
+clustree(cytof_seurat,prefix="RNA_snn_res.")
+cytof_seurat <- FindClusters(cytof_seurat, resolution = 0.5)
+
+# UMAP plot with Harmony correction
+p1 <- DimPlot(cytof_seurat, reduction = "umap", label = TRUE) + NoLegend() + ggtitle("After Harmony")
+p2 <- DimPlot(cytof_seurat, reduction = "umap", group.by = "PatientID") + NoLegend() + ggtitle("After Harmony (by Patient)")
+# UMAP plot without Harmony correction
+cytof_seurat <- RunUMAP(cytof_seurat, reduction = "pca", dims = 1:15, reduction.name = "umap_original")
+p3 <- DimPlot(cytof_seurat, reduction = "umap_original", group.by = "PatientID") + NoLegend() + ggtitle("Before Harmony (by Patient)")
+p3 | p2
+
+cytof_seurat$Disease <- factor(x = cytof_seurat$Disease, levels = c("SPRA", "SNRA", "PMR"))
+DimPlot(cytof_seurat, reduction = "umap", split.by = "Disease", label = TRUE, ncol = 3)
+
+cytof_seurat <- JoinLayers(cytof_seurat) 
+markers <-FindAllMarkers(cytof_seurat, min.pct = 0.25, only.pos = TRUE,logfc.threshold = 0.5) 
+
+#annotate cluster
+new.cluster.ids <- c('Neutrophil',
+                     'Neutrophil',
+                     'Classical Monocyte',
+                     'CD4T',
+                     'CD8T',
+                     'Intermediate_non-classical Monocyte',
+                     'Neutrophil',
+                     'Neutrophil',
+                     'CD4T',
+                     'CD8T',
+                     'NK',
+                     'B cell',
+                     'Plasmablast'
+                     )
+names(new.cluster.ids) <- levels(cytof_seurat)
+cytof_seurat <- RenameIdents(cytof_seurat, new.cluster.ids)
+
+#Plot stacked barplot
+cluster_disease_counts <- table(cytof_seurat@active.ident, cytof_seurat$Disease)
+
+cluster_proportions <- prop.table(cluster_disease_counts, margin = 2)
+
+proportion_df <- as.data.frame(cluster_proportions)
+colnames(proportion_df) <- c("Cluster", "Disease", "Proportion")
+
+ggplot(proportion_df, aes(x = Disease, y = Proportion, fill = Cluster)) +
+  geom_bar(stat = "identity", position = "fill") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Cluster Proportions by Disease Group (After Harmony)", y = "Percentage") +
+  theme_classic()
+
+#Plot stacked barplot for each sample
+plot_df <- data.frame(
+  Cluster = Idents(cytof_seurat),
+  PatientID = cytof_seurat$PatientID,
+  Disease = cytof_seurat$Disease
+)
+
+plot_df <- data.frame(
+  Cluster = Idents(cytof_seurat),
+  PatientID = cytof_seurat$PatientID,
+  Disease = cytof_seurat$Disease
+)
+
+count_df <- plot_df %>%
+  count(Disease, PatientID, Cluster)
+
+
+ggplot(count_df, aes(x = PatientID, y = n, fill = Cluster)) +
+  geom_bar(stat = "identity", position = "fill") +
+  facet_grid(~ Disease, scales = "free_x", space = "free_x") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Cluster Proportions by Patient",
+    subtitle = "Faceted by Disease Group",
+    x = "Patient ID",
+    y = "Percentage",
+    fill = "Cluster"
+  ) +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    strip.background = element_rect(fill = "grey90", color = NA) 
+  )
