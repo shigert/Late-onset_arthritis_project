@@ -1,22 +1,32 @@
+# --- 1. Load necessary packages for analysis ---
 library(Seurat)
 library(flowCore)
 library(dplyr)
 library(ggplot2)
 library(clustree)
 library(tidyr)
+library(broom)
+library(ggsci)
+library(rstatix)
+library(ggpubr)
 
-set.seed(123) 
-fcs_dir <- "enter_path_to_your_fcs_files" 
+# --- 2. Load and preprocess flow cytometry (.fcs) data ---
+# Set the directory where your .fcs files are located
+fcs_dir <- "YOUR DIRECTORY"
 fcs_files <- list.files(fcs_dir, pattern = "\\.fcs$", full.names = TRUE)
 
+# Set a seed for reproducibility
+set.seed(123)
+
+# Read each .fcs file and downsample to 10,000 cells if it has more
+# This standardizes cell counts and reduces computational load
 flow_list <- lapply(fcs_files, function(file_path) {
   ff <- read.FCS(file_path, transformation = FALSE, truncate_max_range = FALSE)
   num_events <- nrow(ff)
-  
-  # Downsample the file if total events are more than 5001
-  if (num_events > 5000) {
-    cat(paste("Downsampling:", basename(file_path), "from", num_events, "to 5000 events.\n"))
-    indices <- sample(1:num_events, 5000)
+
+  if (num_events > 10000) {
+    cat(paste("Downsampling:", basename(file_path), "from", num_events, "to 10000 events.\n"))
+    indices <- sample(1:num_events, 10000)
     ff_sampled <- ff[indices, ]
     return(ff_sampled)
   } else {
@@ -25,34 +35,38 @@ flow_list <- lapply(fcs_files, function(file_path) {
   }
 })
 
+# Combine all individual flow frames into a single flowSet object
 flow_set <- as(flow_list, "flowSet")
 sampleNames(flow_set) <- basename(fcs_files)
+
+# Extract the expression matrix (cells x markers)
 expression_matrix <- fsApply(flow_set, exprs)
 
-metadata_df <- read.table("metadatafile.txt", header = TRUE) 
-sample_ids <- rep(sampleNames(flow_set), fsApply(flow_set, nrow))
 
+# --- 3. Create a Seurat object with metadata ---
+# Read metadata file containing patient information (e.g., Disease, PatientID)
+metadata_df <- read.table("YOUR METADATA FILE", header = TRUE, sep = "\t", stringsAsFactors = FALSE)
+
+# Match metadata to each cell based on its original file name
+sample_ids <- rep(sampleNames(flow_set), fsApply(flow_set, nrow))
 cell_metadata <- data.frame(FileName = sample_ids) %>%
   left_join(metadata_df, by = "FileName")
 
+# Assign unique IDs to each cell
 num_cells <- nrow(expression_matrix)
 cell_ids <- paste0("cell_", 1:num_cells)
-
 rownames(expression_matrix) <- cell_ids
 rownames(cell_metadata) <- cell_ids
 
-#Create Seurat Object
+# Create the Seurat object. Note: expression matrix is transposed (t())
+# Seurat expects features (markers) as rows and cells as columns.
 cytof_seurat <- CreateSeuratObject(counts = t(expression_matrix), meta.data = cell_metadata)
 
-#Translate metal name to Molecule
-marker_map_file <- "markermolecule.txt, header =T" 
+# --- 4. Rename marker channels to human-readable antigen names ---
+marker_map_file <- "/Users/stanaka/Documents/analyisis_fv/m_list.txt"
 marker_mapping <- read.table(marker_map_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
-
 feature_rename_map <- setNames(marker_mapping$antigen, marker_mapping$fcs_colname)
-
-current_feature_names <- rownames(cytof_seurat)
-
-new_feature_names <- sapply(current_feature_names, function(name) {
+new_feature_names <- sapply(marker_mapping$fcs_colname, function(name) {
   if (name %in% names(feature_rename_map)) {
     return(feature_rename_map[[name]])
   } else {
@@ -60,127 +74,455 @@ new_feature_names <- sapply(current_feature_names, function(name) {
   }
 }, USE.NAMES = FALSE)
 
-rownames(cytof_seurat[["RNA"]]) <- new_feature_names
+# Apply new names to the Seurat object
+rownames(cytof_seurat[["CYTOF"]]) <- new_feature_names
 
-
-# Arcsinh transformation
+# --- 5. Data transformation and scaling ---
+# Apply inverse hyperbolic sine (asinh) transformation, common for CyTOF data
 cofactor <- 5
-cytof_seurat@assays$RNA$data <- asinh(cytof_seurat@assays$RNA$counts / cofactor)
-#Scaling
+cytof_seurat@assays$CYTOF$data <- asinh(cytof_seurat@assays$CYTOF$counts / cofactor)
+
+# Scale the data (z-scoring) so all markers have a mean of 0 and variance of 1
 all_markers <- rownames(cytof_seurat)
 cytof_seurat <- ScaleData(cytof_seurat, features = all_markers)
 
-# PCA
+# --- 6. Dimensionality reduction and batch correction ---
+# Run PCA for initial dimensionality reduction
 cytof_seurat <- RunPCA(
   cytof_seurat,
   features = all_markers,
-  npcs = length(all_markers), 
-  approx = FALSE,             
+  npcs = length(all_markers),
+  approx = FALSE,
   verbose = FALSE
 )
-# Harmony correction
+
+# Use Harmony to correct for batch effects between patients
 pca_embeddings <- Embeddings(cytof_seurat, "pca")
 meta_data <- cytof_seurat@meta.data
-
 harmony_embeddings <- harmony::RunHarmony(
   data_mat = pca_embeddings,
   meta_data = meta_data,
-  vars_use = "PatientID" # バッチ補正に使う変数
+  vars_use = "PatientID"
 )
 
-rownames(harmony_embeddings) <- rownames(pca_embeddings) 
+# Store the Harmony-corrected dimensions in the Seurat object
+rownames(harmony_embeddings) <- rownames(pca_embeddings)
 cytof_seurat[["harmony"]] <- CreateDimReducObject(
-  embeddings = harmony_embeddings, 
-  key = "harmony_", 
-  assay = "RNA"
+  embeddings = harmony_embeddings,
+  key = "harmony_",
+  assay = "CYTOF"
 )
 
-# UMAP
+
+# --- 7. Clustering and visualization ---
+# Run UMAP for visualization using the batch-corrected 'harmony' dimensions
 cytof_seurat <- RunUMAP(cytof_seurat, reduction = "harmony", dims = 1:15)
 
-#Clustering
+# Find cell clusters based on the 'harmony' dimensions
 cytof_seurat <- FindNeighbors(cytof_seurat, reduction = "harmony", dims = 1:15)
+
+# Test different clustering resolutions and visualize with clustree to find the optimal one
 res=seq(0,1,0.1)
 for (i in 1:length(res)){cytof_seurat <- FindClusters(cytof_seurat, resolution = res[i])}
-clustree(cytof_seurat,prefix="RNA_snn_res.")
-cytof_seurat <- FindClusters(cytof_seurat, resolution = 0.5)
+clustree(cytof_seurat,prefix="CYTOF_snn_res.")
 
-# UMAP plot with Harmony correction
+# Set the final clustering resolution
+cytof_seurat <- FindClusters(cytof_seurat, resolution = 1)
+
+# Visualize the effect of Harmony batch correction
 p1 <- DimPlot(cytof_seurat, reduction = "umap", label = TRUE) + NoLegend() + ggtitle("After Harmony")
 p2 <- DimPlot(cytof_seurat, reduction = "umap", group.by = "PatientID") + NoLegend() + ggtitle("After Harmony (by Patient)")
-# UMAP plot without Harmony correction
-cytof_seurat <- RunUMAP(cytof_seurat, reduction = "pca", dims = 1:15, reduction.name = "umap_original")
+cytof_seurat <- RunUMAP(cytof_seurat, reduction = "pca", dims = 1:15, reduction.name = "umap_original") # UMAP on original PCA
 p3 <- DimPlot(cytof_seurat, reduction = "umap_original", group.by = "PatientID") + NoLegend() + ggtitle("Before Harmony (by Patient)")
-p3 | p2
+p3 | p2 # Compare UMAPs before and after Harmony
 
-cytof_seurat$Disease <- factor(x = cytof_seurat$Disease, levels = c("SPRA", "SNRA", "PMR"))
-DimPlot(cytof_seurat, reduction = "umap", split.by = "Disease", label = TRUE, ncol = 3)
+# Set the order of disease groups for plotting
+cytof_seurat$Disease <- factor(x = cytof_seurat$Disease, levels = c("ACPA+RA", "ACPA-RA", "PMR"))
 
-cytof_seurat <- JoinLayers(cytof_seurat) 
-markers <-FindAllMarkers(cytof_seurat, min.pct = 0.25, only.pos = TRUE,logfc.threshold = 0.5) 
+# --- 8. Find cluster markers and annotate clusters ---
+cytof_seurat <- JoinLayers(cytof_seurat)
+# Find differentially expressed markers for each cluster
+markers <-FindAllMarkers(cytof_seurat, min.pct = 0.25, only.pos = TRUE,logfc.threshold = 0.5)
 
-#annotate cluster
+# Annotate clusters with cell type names based on marker expression
 new.cluster.ids <- c('Neutrophil',
                      'Neutrophil',
+                     'Neutrophil',
                      'Classical Monocyte',
-                     'CD4T',
-                     'CD8T',
-                     'Intermediate_non-classical Monocyte',
+                     'CD8+ T cell',
+                     'Intermediate Monocyte',
+                     'Intermediate Monocyte',
+                     'Neutrophil',
+                     'CD4+ T cell',
+                     'CD4+ T cell',
                      'Neutrophil',
                      'Neutrophil',
-                     'CD4T',
-                     'CD8T',
-                     'NK',
-                     'B cell',
-                     'Plasmablast'
+                     'Non-Classical Monocyte',
+                     'Neutrophil',
+                     'Classical Monocyte',
+                     'CD8+ T cell',
+                     'CD4+ T cell',
+                     'NK cell',
+                     'CD8+ T cell',
+                     'NK cell',
+                     'CD4+ T cell',
+                     'Unknown',
+                     'Unknown',
+                     'Atypical T cell',
+                     'Atypical T cell',
+                     'CD8+ T cell',
+                     'Neutrophil',
+                     'Unknown'
                      )
 names(new.cluster.ids) <- levels(cytof_seurat)
 cytof_seurat <- RenameIdents(cytof_seurat, new.cluster.ids)
 
-#Plot stacked barplot
-cluster_disease_counts <- table(cytof_seurat@active.ident, cytof_seurat$Disease)
+# Generate and save UMAP plot with final cell type annotations (Figure 1A)
+d <- DimPlot(cytof_seurat, reduction = "umap", label = F)
+d_modified <- d + theme(
+  text = element_text(size = 8),
+  axis.text = element_text(size = 8)
+)
+print(d_modified)
+ggsave("Figure1A.pdf", plot = d_modified, width = 3.5, height = 2, units = "in")
 
-cluster_proportions <- prop.table(cluster_disease_counts, margin = 2)
+# Generate and save a violin plot of key markers to confirm annotations (Figure S2)
+v<-VlnPlot(cytof_seurat, features = c("CD3", "CD4", "CD8a", "CD14", "CD16", "CD19","CD56", "CD66b", "TCRgd", "IL3R", "CD11c"), pt.size = 0, stack = T, flip = T) + NoLegend()
+v_modified <- v +
+  labs( x = NULL) +
+  theme(
+  text = element_text(size = 8),
+  axis.text = element_text(size = 8)
+  )
+print(v_modified)
+ggsave("FigureS2.pdf", plot = v_modified, width = 3, height = 3, units = "in")
 
-proportion_df <- as.data.frame(cluster_proportions)
-colnames(proportion_df) <- c("Cluster", "Disease", "Proportion")
+# --- 9. Compositional analysis (compare cell proportions across diseases) ---
+# Calculate the proportion of each cell type for each patient
+meta_data <- cytof_seurat@meta.data
+meta_data$Cluster <- cytof_seurat@active.ident
+cell_counts <- meta_data %>%
+  group_by(PatientID, Disease, Cluster) %>%
+  summarise(CellCount = n(), .groups = 'drop') %>%
+  complete(PatientID, Cluster, fill = list(CellCount = 0)) %>%
+  group_by(PatientID) %>%
+  fill(Disease, .direction = "downup") %>%
+  ungroup()
+proportion_per_sample_df <- cell_counts %>%
+  group_by(PatientID) %>%
+  mutate(TotalCellsInSample = sum(CellCount),
+         Proportion = CellCount / TotalCellsInSample) %>%
+  ungroup()
+write.csv(proportion_per_sample_df, "YOUR WORKING DIRECTORY/proportion_total.csv")
 
-ggplot(proportion_df, aes(x = Disease, y = Proportion, fill = Cluster)) +
-  geom_bar(stat = "identity", position = "fill") +
-  scale_y_continuous(labels = scales::percent) +
-  labs(title = "Cluster Proportions by Disease Group (After Harmony)", y = "Percentage") +
-  theme_classic()
+# Perform ANOVA and Tukey's post-hoc test for each cell type
+# to see if its proportion differs significantly between disease groups
+for (cluster_id in unique(proportion_per_sample_df$Cluster)) {
+  cluster_data <- proportion_per_sample_df %>%
+    filter(Cluster == cluster_id)
+  anova_model <- aov(Proportion ~ Disease, data = cluster_data)
+  anova_summary <- summary(anova_model)
 
-#Plot stacked barplot for each sample
+  cat("=========================================================\n")
+  cat(" ANOVA Results for:", as.character(cluster_id), "\n")
+  cat("=========================================================\n")
+  print(anova_summary)
+
+  p_value <- anova_summary[[1]][["Pr(>F)"]][1]
+  if (!is.na(p_value) && p_value < 0.05) {
+    cat("\n--- Tukey's HSD Post-hoc Test ---\n")
+    tukey_result <- TukeyHSD(anova_model)
+    print(tukey_result)
+  }
+  cat("\n\n")
+}
+
+# --- 10. Visualize compositional analysis results ---
+# Generate a stacked bar plot of cell proportions per patient (Figure 1B)
 plot_df <- data.frame(
   Cluster = Idents(cytof_seurat),
   PatientID = cytof_seurat$PatientID,
   Disease = cytof_seurat$Disease
 )
-
-plot_df <- data.frame(
-  Cluster = Idents(cytof_seurat),
-  PatientID = cytof_seurat$PatientID,
-  Disease = cytof_seurat$Disease
-)
-
 count_df <- plot_df %>%
   count(Disease, PatientID, Cluster)
-
-
-ggplot(count_df, aes(x = PatientID, y = n, fill = Cluster)) +
+p2<-ggplot(count_df, aes(x = PatientID, y = n, fill = Cluster)) +
   geom_bar(stat = "identity", position = "fill") +
   facet_grid(~ Disease, scales = "free_x", space = "free_x") +
   scale_y_continuous(labels = scales::percent_format()) +
   labs(
-    title = "Cluster Proportions by Patient",
-    subtitle = "Faceted by Disease Group",
     x = "Patient ID",
-    y = "Percentage",
+    y = "%",
     fill = "Cluster"
   ) +
   theme_classic() +
   theme(
-    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
-    strip.background = element_rect(fill = "grey90", color = NA) 
+    strip.background = element_rect(fill = "grey90", color = NA) ,
+    axis.text.x = element_text(angle = 45, hjust = 1,size = 8, color = 'black'),
+    axis.text.y = element_text(size = 8, color = 'black'),
+    axis.title.x = element_text(size = 8, color = 'black'),
+    axis.title.y = element_text(size = 8, color = 'black') ,
+    legend.position = 'none'
   )
+print(p2)
+ggsave("Figure1B.pdf", plot = p2, width = 3.5, height = 2, units = "in")
+
+# Prepare data for boxplots with statistical significance
+proportion_per_sample_df <- proportion_per_sample_df %>%
+  mutate(Percentage = Proportion * 100)
+cluster_max_values <- proportion_per_sample_df %>%
+  group_by(Cluster) %>%
+  summarise(max_percentage = max(Percentage), .groups = 'drop')
+stat_test_initial <- proportion_per_sample_df %>%
+  group_by(Cluster) %>%
+  tukey_hsd(Percentage ~ Disease) %>%
+  mutate(p.adj.signif = case_when(
+    p.adj <= 0.001 ~ "***",
+    p.adj <= 0.01  ~ "**",
+    p.adj <= 0.05  ~ "*",
+    TRUE           ~ "ns"
+  )) %>%
+  add_xy_position(x = "Disease")
+stat_test_adjusted <- stat_test_initial %>%
+  left_join(cluster_max_values, by = "Cluster") %>%
+  group_by(Cluster) %>%
+  mutate(
+    step = max_percentage * 0.08,
+    y.position = max_percentage + (step * row_number())
+  ) %>%
+  ungroup()
+
+# Generate boxplots comparing cell proportions across diseases (Figure 1C)
+b <- ggplot(proportion_per_sample_df, aes(x = Disease, y = Percentage, fill = Disease)) +
+  stat_summary(fun = "mean", geom = "bar", alpha = 0.6, color = "black") +
+  stat_summary(fun.data = "mean_se", geom = "errorbar", width = 0.2) +
+  geom_jitter(width = 0.2, shape = 21, size = 1.8, stroke = 0.5, fill = "white") +
+  stat_pvalue_manual(stat_test_adjusted, label = "p.adj.signif", tip.length = 0.01, hide.ns = TRUE) +
+  facet_wrap(~ Cluster, scales = "free_y", nrow = 2) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+    labs(
+    x = NULL,
+    y = "%"
+  ) +
+  theme_classic() +
+  scale_fill_jama() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_text(size = 8, color = 'black'),
+    axis.ticks.x = element_blank(),
+    axis.title.y = element_text(size = 8, color = 'black'),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 8)
+  )
+
+print(b)
+ggsave("Figure1C.pdf", plot = b, width = 8, height = 3, units = "in")
+
+
+##############################
+###### T cell analysis #######
+##############################
+# The following section repeats the analysis pipeline on a subset of the data containing only T cells.
+
+# --- 11. Subset T cells and re-run clustering ---
+# Create a new Seurat object containing only T cell clusters
+tcell_seurat <- subset(cytof_seurat, idents = c("CD4+ T cell", "CD8+ T cell", "Atypical T cell"))
+
+# Re-run PCA on the T cell subset
+all_markers <- rownames(tcell_seurat)
+tcell_seurat <- RunPCA(
+  tcell_seurat,
+  features = all_markers,
+  npcs = length(all_markers),
+  verbose = FALSE,
+  approx = FALSE
+)
+
+# Re-run Harmony batch correction on the T cell subset
+pca_embeddings_tcell <- Embeddings(tcell_seurat, "pca")
+meta_data_tcell <- tcell_seurat@meta.data
+harmony_embeddings_tcell <- harmony::RunHarmony(
+  data_mat = pca_embeddings_tcell,
+  meta_data = meta_data_tcell,
+  vars_use = "PatientID"
+)
+tcell_seurat[["harmony_tcell"]] <- CreateDimReducObject(
+  embeddings = harmony_embeddings_tcell,
+  key = "harmonyT_",
+  assay = DefaultAssay(tcell_seurat)
+)
+
+# Re-run UMAP and clustering for T cell subtypes
+tcell_seurat <- RunUMAP(tcell_seurat, reduction = "harmony_tcell", dims = 1:15)
+tcell_seurat <- FindNeighbors(tcell_seurat, reduction = "harmony_tcell", dims = 1:15)
+res=seq(0,1,0.1)
+for (i in 1:length(res)){tcell_seurat <- FindClusters(tcell_seurat, resolution = res[i])}
+clustree(tcell_seurat,prefix="CYTOF_snn_res.")
+tcell_seurat <- FindClusters(tcell_seurat, resolution = 0.6)
+DimPlot(tcell_seurat, reduction = "umap", label = TRUE) + NoLegend()
+
+# Generate violin plot to check T cell subset marker expression (Figure S3A)
+v2<-VlnPlot(tcell_seurat, features = c("CD38", "CD56", "TCRgd", "CCR7", "CD161","CD25", "CD57", "CXCR3", "CXCR5", "CD28","PD-1", "CD4", "CD8a", "CD45RA", "CCR6", "CD45RO", "CCR4", "CD27", "HLA-DR", "CD127"), pt.size = 0, stack = T, flip = T) + NoLegend()
+v2_modified <- v2 +
+  labs( x = NULL) +
+  theme(
+    text = element_text(size = 8),
+    axis.text = element_text(size = 8)
+  )
+print(v2_modified)
+ggsave("FigureS3A.pdf", plot = v2_modified, width = 7, height = 5, units = "in")
+
+# --- 12. Annotate T cell sub-clusters ---
+# Find markers for each T cell sub-cluster
+tcell_seurat <- JoinLayers(tcell_seurat)
+tmarkers <-FindAllMarkers(tcell_seurat, min.pct = 0.25, only.pos = TRUE,logfc.threshold = 0.5)
+
+# Annotate T cell sub-clusters based on their markers
+new.cluster.ids <- c('Activated CD8T',
+                     'Th17',
+                     'CD57+ CD8T',
+                     'CM CD8T',
+                     'Treg',
+                     'senescent CD4T',
+                     'Naive CD8T',
+                     'Tph',
+                     'CM CD4T',
+                     'CD57+ CD4T',
+                     'Th17',
+                     'CD161+ CD8T',
+                     'Tfh',
+                     'Activated CD4T',
+                     'CXCR5+ CD8T',
+                     'CD56+ CD8T',
+                     'gdT'
+                     )
+names(new.cluster.ids) <- levels(tcell_seurat)
+tcell_seurat <- RenameIdents(tcell_seurat, new.cluster.ids)
+
+# Generate and save UMAP plot of annotated T cell subsets (Figure S3B)
+d2 <- DimPlot(tcell_seurat, reduction = "umap", label = F)
+d2_modified <- d2 + theme(
+  text = element_text(size = 8),
+  axis.text = element_text(size = 8)
+)
+print(d_modified)
+ggsave("FigureS3B.pdf", plot = d_modified, width = 3, height = 1.8, units = "in")
+
+# --- 13. Compositional analysis for T cell subsets ---
+# Generate stacked bar plot of T cell subset proportions per patient (Figure S3C)
+plot_df <- data.frame(
+  Cluster = Idents(tcell_seurat),
+  PatientID = tcell_seurat$PatientID,
+  Disease = tcell_seurat$Disease
+)
+count_df <- plot_df %>%
+  count(Disease, PatientID, Cluster)
+p4<-ggplot(count_df, aes(x = PatientID, y = n, fill = Cluster)) +
+  geom_bar(stat = "identity", position = "fill") +
+  facet_grid(~ Disease, scales = "free_x", space = "free_x") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = "Patient ID",
+    y = "%",
+    fill = "Cluster"
+  ) +
+  theme_classic() +
+  theme(
+    strip.background = element_rect(fill = "grey90", color = NA) ,
+    axis.text.x = element_text(angle = 45, hjust = 1,size = 8, color = 'black'),
+    axis.text.y = element_text(size = 8, color = 'black'),
+    axis.title.x = element_text(size = 8, color = 'black'),
+    axis.title.y = element_text(size = 8, color = 'black') ,
+    legend.position = 'none'
+  )
+print(p4)
+ggsave("FigureS3C.pdf", plot = p4, width = 5, height = 2, units = "in")
+
+# Calculate proportions of T cell subsets and run statistical tests
+meta_data <- tcell_seurat@meta.data
+meta_data$Cluster <- tcell_seurat@active.ident
+cell_counts <- meta_data %>%
+  group_by(PatientID, Disease, Cluster) %>%
+  summarise(CellCount = n(), .groups = 'drop') %>%
+  complete(PatientID, Cluster, fill = list(CellCount = 0)) %>%
+  group_by(PatientID) %>%
+  fill(Disease, .direction = "downup") %>%
+  ungroup()
+proportion_per_sample_df <- cell_counts %>%
+  group_by(PatientID) %>%
+  mutate(TotalCellsInSample = sum(CellCount),
+         Proportion = CellCount / TotalCellsInSample) %>%
+  ungroup()
+write.csv(proportion_per_sample_df, "YOUR WORKING DIRECTORY/proportion_tcell.csv")
+
+# Perform ANOVA and Tukey's test for each T cell subset
+for (cluster_id in unique(proportion_per_sample_df$Cluster)) {
+  cluster_data <- proportion_per_sample_df %>%
+    filter(Cluster == cluster_id)
+  anova_model <- aov(Proportion ~ Disease, data = cluster_data)
+  anova_summary <- summary(anova_model)
+
+  cat("=========================================================\n")
+  cat(" Robust ANOVA Results for:", as.character(cluster_id), "\n")
+  cat("=========================================================\n")
+  print(anova_summary)
+
+  p_value <- anova_summary[[1]][["Pr(>F)"]][1]
+  if (!is.na(p_value) && p_value < 0.05) {
+    cat("\n--- Tukey's HSD Post-hoc Test ---\n")
+    tukey_result <- TukeyHSD(anova_model)
+    print(tukey_result)
+  }
+  cat("\n\n")
+}
+
+# Prepare data for T cell subset boxplots with statistical significance
+proportion_per_sample_df <- proportion_per_sample_df %>%
+  mutate(Percentage = Proportion * 100)
+cluster_max_values <- proportion_per_sample_df %>%
+  group_by(Cluster) %>%
+  summarise(max_percentage = max(Percentage), .groups = 'drop')
+stat_test_initial <- proportion_per_sample_df %>%
+  group_by(Cluster) %>%
+  tukey_hsd(Percentage ~ Disease) %>%
+  mutate(p.adj.signif = case_when(
+    p.adj <= 0.001 ~ "***",
+    p.adj <= 0.01  ~ "**",
+    p.adj <= 0.05  ~ "*",
+    TRUE           ~ "ns"
+  )) %>%
+  add_xy_position(x = "Disease")
+stat_test_adjusted <- stat_test_initial %>%
+  left_join(cluster_max_values, by = "Cluster") %>%
+  group_by(Cluster) %>%
+  mutate(
+    step = max_percentage * 0.08,
+    y.position = max_percentage + (step * row_number())
+  ) %>%
+  ungroup()
+
+# Generate boxplots for T cell subset proportions (Figure S3D)
+bt <- ggplot(proportion_per_sample_df, aes(x = Disease, y = Percentage, fill = Disease)) +
+  stat_summary(fun = "mean", geom = "bar", alpha = 0.6, color = "black") +
+  stat_summary(fun.data = "mean_se", geom = "errorbar", width = 0.2) +
+  geom_jitter(width = 0.2, shape = 21, size = 1.8, stroke = 0.5, fill = "white") +
+  stat_pvalue_manual(stat_test_adjusted, label = "p.adj.signif", tip.length = 0.01, hide.ns = TRUE) +
+  facet_wrap(~ Cluster, scales = "free_y", nrow = 2) +
+  scale_y_continuous(expand = expansion(mult = c(0.05, 0.1))) +
+  labs(
+    x = NULL,
+    y = "%"
+  ) +
+  theme_classic() +
+  scale_fill_jama() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.text.y = element_text(size = 8, color = 'black'),
+    axis.ticks.x = element_blank(),
+    axis.title.y = element_text(size = 8, color = 'black'),
+    strip.background = element_blank(),
+    strip.text = element_text(size = 8)
+  )
+
+print(bt)
+ggsave("FigureS3D.pdf", plot = bt, width = 8, height = 2.3, units = "in")
