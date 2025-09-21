@@ -231,6 +231,8 @@ ht2 <- Heatmap(
   clustering_distance_rows = "euclidean",
   clustering_method_rows = "complete",
   show_row_names = TRUE,
+  row_split = 2,
+  row_title = NULL,
   row_names_gp = gpar(fontsize = 6),
   row_title_gp = gpar(fontsize = 8),
   
