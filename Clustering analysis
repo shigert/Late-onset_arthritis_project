@@ -202,6 +202,7 @@ col_fun <- colorRamp2(c(-2.5, 0, 2.5), c("dodgerblue", "white", "red"))
 ht1 <- Heatmap(
   t(clustering_matrix_B),
   height = unit(0, "cm"),
+  rect_gp = gpar(type = "none"), 
   show_heatmap_legend = FALSE,
   
   # Column (patient) clustering settings
