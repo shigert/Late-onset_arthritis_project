@@ -1,0 +1,81 @@
+# Load libraries
+library(tidyverse)
+library(rstatix)
+library(readxl)
+library(ggpubr)
+
+# Set working directory and load data
+plot_data_long <- read_xlsx("STAININDEX.xlsx")
+
+# Define position dodge
+pos_d <- position_dodge(width = 0.7)
+
+# Create the main plot
+multi_exp_plot_dodged <- ggplot(
+  plot_data_long,
+  aes(x = target, y = value, color = PatientID, fill = staining)
+) +
+  geom_line(
+    aes(group = interaction(target, PatientID)),
+    position = pos_d
+  ) +
+  geom_point(
+    shape = 21,
+    size = 2,
+    stroke = 1,
+    position = pos_d
+  ) +
+  # Set legend and colors
+  scale_fill_manual(
+    name = "Condition",
+    values = c("stain-then-freeze" = "black", "regular" = "white")
+  ) +
+  scale_color_brewer(
+    name = "PatientID",
+    palette = "Set2"
+  ) +
+  # Set axes
+  scale_y_continuous(name = NULL) +
+  scale_x_discrete(name = NULL) +
+  # Set theme and fine-tune details
+  theme_classic() +
+  guides(
+    fill = guide_legend(override.aes = list(color = "black")),
+    color = guide_legend(override.aes = list(alpha = 1))
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 0.5, vjust = 0.5, size = 8, colour = "black"),
+    axis.text.y = element_text(size = 8, colour = "black"),
+    axis.title.y = element_text(size = 8, colour = "black", angle = 0, vjust = 1.05, hjust = 0.5),
+    axis.line = element_line(linewidth = 0.5),
+    axis.ticks.y = element_line(colour = "black"),
+    axis.ticks.length.y = unit(0.2, "cm"),
+    axis.ticks.x = element_blank(),
+    legend.position = "top",
+    plot.margin = margin(t = 5, r = 10, b = 5, l = 10)
+  )
+
+# --- Perform statistical analysis ---
+# Run paired t-test for each group
+stat_test <- plot_data_long %>%
+  group_by(target) %>%
+  t_test(value ~ staining, paired = TRUE)
+
+# Prepare significance labels for the plot
+stat_test_for_plot <- stat_test %>%
+  add_significance("p") %>%
+  filter(p.signif != "ns") %>%
+  add_xy_position(x = "target", dodge = 0.7)
+
+# --- Add significance to the plot ---
+multi_exp_plot_with_asterisk <- multi_exp_plot_dodged +
+  stat_pvalue_manual(
+    stat_test_for_plot,
+    label = "{p.signif}",
+    tip.length = 0.01,
+    size = 6
+  )
+
+# Print and save the final plot
+print(multi_exp_plot_with_asterisk)
+ggsave("FigureS2A.pdf", plot = multi_exp_plot_with_asterisk, width = 7, height = 2.5, units = "in")
