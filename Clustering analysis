@@ -27,7 +27,7 @@ flow_data <- datanew %>%
   pivot_wider(id_cols = PatientID, names_from = Cluster, values_from = Proportion)
 
 # --- Load and preprocess blood test data ---
-blood_data <- read.csv("ecl2_blood.csv", header = TRUE)
+blood_data <- read.csv("ecl_blood.csv", header = TRUE)
 # Sanitize column names (replace '.' with '-')
 colnames(blood_data) <- gsub("\\.", "-", colnames(blood_data))
 blood_params <- colnames(blood_data)[-1]
