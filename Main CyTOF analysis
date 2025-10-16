@@ -63,7 +63,7 @@ rownames(cell_metadata) <- cell_ids
 cytof_seurat <- CreateSeuratObject(counts = t(expression_matrix), meta.data = cell_metadata)
 
 # --- 4. Rename marker channels to human-readable antigen names ---
-marker_map_file <- "/Users/stanaka/Documents/analyisis_fv/m_list.txt"
+marker_map_file <- "m_list.txt"
 marker_mapping <- read.table(marker_map_file, header = TRUE, sep = "\t", stringsAsFactors = FALSE)
 feature_rename_map <- setNames(marker_mapping$antigen, marker_mapping$fcs_colname)
 new_feature_names <- sapply(marker_mapping$fcs_colname, function(name) {
