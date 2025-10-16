@@ -1,56 +1,78 @@
+# ==============================================================================
+# 1. SETUP: Load libraries, set seed, and prepare data
+# ==============================================================================
+
+# Load required libraries
 library(tidyverse)
 library(compositions)
 library(missMDA)
 library(FactoMineR)
 library(factoextra)
 library(ComplexHeatmap)
+library(circlize)
 library(ggsci)
-library(ggplot2)
-library(tibble)
 
 # Set random seed for reproducibility
 set.seed(123)
 
-# Load and prepare cytof cytometry data
-cytof_data <- <- read.csv("test_cytof.csv", header = TRUE)
+# --- Load and preprocess flow cytometry data ---
+# Raw proportion data
+data <- read.csv("proportion_total.csv", header = TRUE)
+data2 <- read.csv("proportion_tcell2.csv", header = TRUE)
+# Remove T-cell data from the first dataframe and merge with the second
+new_data <- data[!grepl("T cell", data$Cluster), ]
+datanew <- rbind(new_data, data2)
+# Reshape data to wide format (patients as rows, cell clusters as columns)
+flow_data <- datanew %>%
+  pivot_wider(id_cols = PatientID, names_from = Cluster, values_from = Proportion)
 
-# Load soluble test data
-soluble_data <- read.csv("test_soluble.csv", header = TRUE)
-soluble_params <- colnames(soluble_data)[-1]
+# --- Load and preprocess blood test data ---
+blood_data <- read.csv("ecl2_blood.csv", header = TRUE)
+# Sanitize column names (replace '.' with '-')
+colnames(blood_data) <- gsub("\\.", "-", colnames(blood_data))
+blood_params <- colnames(blood_data)[-1]
 
-# Load metadata
-disease_info <- read.csv("disease_info.csv", header = TRUE)
+# --- Prepare metadata (disease information) ---
+disease_info <- data %>%
+  select(PatientID, Disease) %>%
+  distinct()
+# Set the order of disease factors for consistent plotting
 disease_info$Disease <- factor(disease_info$Disease, levels = c("ACPA+RA", "ACPA-RA", "PMR"))
 
-# Define color palette
+# --- Define color palette for plotting ---
 jama_colors <- pal_jama("default")(3)
 names(jama_colors) <- c("ACPA+RA", "ACPA-RA", "PMR")
+
 
 # ==============================================================================
 # 2. Principal Component Analysis (PCA)
 # ==============================================================================
 
-# 2a. PCA on cytof cytometry data only
-# ------------------------------------------------------------------------------
-cytof_matrix_for_pca <- cytof_data %>%
+# --- 2a. PCA on flow cytometry data only ---
+flow_matrix_for_pca <- flow_data %>%
   select(-PatientID) %>%
   as.matrix()
-rownames(cytof_matrix_for_pca) <- cytof_data$PatientID
-cytof_ilr <- ilr(acomp(cytof_matrix_for_pca))
-pca_cytof <- PCA(cytof_ilr, graph = FALSE, scale.unit = TRUE)
+rownames(flow_matrix_for_pca) <- flow_data$PatientID
+# Apply isometric log-ratio (ilr) transformation for compositional data
+flow_ilr <- ilr(acomp(flow_matrix_for_pca))
+# Perform PCA
+pca_flow <- PCA(flow_ilr, graph = FALSE, scale.unit = TRUE)
 
-# Combine PCA coordinates with disease information for plotting
-pca_coords1 <- as.data.frame(pca_cytof$ind$coord)
+# -- Create PCA plot --
+# 1. Extract sample coordinates from PCA results
+pca_coords1 <- as.data.frame(pca_flow$ind$coord)
+# 2. Move row names to a new column 'PatientID' for merging
 pca_coords1 <- rownames_to_column(pca_coords1, var = "PatientID")
+# 3. Join with disease information
 pca_plot_data1 <- dplyr::left_join(pca_coords1, disease_info, by = "PatientID")
 
-# Create and save PCA plot
+# 4. Create the plot using ggplot2
 pca_plot_ggplot1 <- ggplot(pca_plot_data1, aes(x = Dim.1, y = Dim.2, color = Disease)) +
-  geom_point(size = 2, alpha = 0.6) +
+  geom_point(size = 2) +
   scale_color_manual(values = jama_colors) +
   labs(
-    x = paste0("PC1 (", round(pca_cytof$eig[1, 2], 2), "%)"),
-    y = paste0("PC2 (", round(pca_cytof$eig[2, 2], 2), "%)"),
+    x = paste0("PC1 (", round(pca_flow$eig[1, 2], 2), "%)"),
+    y = paste0("PC2 (", round(pca_flow$eig[2, 2], 2), "%)"),
     color = "Disease"
   ) +
   theme_bw(base_size = 8) +
@@ -62,31 +84,33 @@ pca_plot_ggplot1 <- ggplot(pca_plot_data1, aes(x = Dim.1, y = Dim.2, color = Dis
     axis.text = element_text(size = 8, color = "black"),
     axis.title = element_text(size = 8, color = "black")
   )
-print(pca_plot_ggplot1)
+
 ggsave("Figure2A.pdf", plot = pca_plot_ggplot1, width = 3, height = 2.5)
 
-# 2b. PCA on soluble test data only
-# ------------------------------------------------------------------------------
-soluble_data_complete <- soluble_data %>% na.omit()
-disease_info_complete <- disease_info %>% filter(PatientID %in% soluble_data_complete$PatientID)
-soluble_matrix_for_pca <- soluble_data_complete %>%
+# --- 2b. PCA on blood test data only ---
+# Remove rows with any missing values for this specific PCA
+blood_data_complete <- blood_data %>% na.omit()
+# Filter metadata to match the complete blood data
+disease_info_complete <- disease_info %>% filter(PatientID %in% blood_data_complete$PatientID)
+# Prepare matrix for PCA
+blood_matrix_for_pca <- blood_data_complete %>%
   select(-PatientID) %>%
   as.matrix()
-rownames(soluble_matrix_for_pca) <- soluble_data_complete$PatientID
-pca_soluble <- PCA(soluble_matrix_for_pca, graph = FALSE, scale.unit = TRUE)
+rownames(blood_matrix_for_pca) <- blood_data_complete$PatientID
+# Perform PCA
+pca_blood <- PCA(blood_matrix_for_pca, graph = FALSE, scale.unit = TRUE)
 
-# Combine PCA coordinates with disease information for plotting
-pca_coords2 <- as.data.frame(pca_soluble$ind$coord)
+# -- Create PCA plot --
+pca_coords2 <- as.data.frame(pca_blood$ind$coord)
 pca_coords2 <- rownames_to_column(pca_coords2, var = "PatientID")
 pca_plot_data2 <- dplyr::left_join(pca_coords2, disease_info, by = "PatientID")
 
-# Create and save PCA plot
 pca_plot_ggplot2 <- ggplot(pca_plot_data2, aes(x = Dim.1, y = Dim.2, color = Disease)) +
-  geom_point(size = 2, alpha = 0.6) +
+  geom_point(size = 2) +
   scale_color_manual(values = jama_colors) +
   labs(
-    x = paste0("PC1 (", round(pca_soluble$eig[1, 2], 2), "%)"),
-    y = paste0("PC2 (", round(pca_soluble$eig[2, 2], 2), "%)"),
+    x = paste0("PC1 (", round(pca_blood$eig[1, 2], 2), "%)"),
+    y = paste0("PC2 (", round(pca_blood$eig[2, 2], 2), "%)"),
     color = "Disease"
   ) +
   theme_bw(base_size = 8) +
@@ -98,28 +122,30 @@ pca_plot_ggplot2 <- ggplot(pca_plot_data2, aes(x = Dim.1, y = Dim.2, color = Dis
     axis.text = element_text(size = 8, color = "black"),
     axis.title = element_text(size = 8, color = "black")
   )
-print(pca_plot_ggplot2)
+
 ggsave("Figure2B.pdf", plot = pca_plot_ggplot2, width = 3, height = 2.5)
 
-# 2c. PCA on combined data with imputation
-# ------------------------------------------------------------------------------
-cytof_ilr_df <- as.data.frame(cytof_ilr)
-cytof_ilr_df$PatientID <- rownames(cytof_ilr_df)
-combined_data <- full_join(cytof_ilr_df, soluble_data, by = "PatientID")
+# --- 2c. PCA on combined data with imputation ---
+# Combine ILR-transformed flow data with blood data
+flow_ilr_df <- as.data.frame(flow_ilr)
+flow_ilr_df$PatientID <- rownames(flow_ilr_df)
+combined_data <- full_join(flow_ilr_df, blood_data, by = "PatientID")
+# Prepare matrix for imputation
 pca_input_matrix_with_id <- combined_data %>%
   column_to_rownames("PatientID")
+# Impute missing values using PCA
 imputed_data <- imputePCA(pca_input_matrix_with_id, ncp = 3, scale = TRUE)
 pca_input_imputed <- imputed_data$completeObs
+# Perform PCA on the complete, combined data
 pca_combined <- PCA(pca_input_imputed, graph = FALSE, scale.unit = TRUE)
 
-# Combine PCA coordinates with disease information for plotting
+# -- Create PCA plot --
 pca_coords3 <- as.data.frame(pca_combined$ind$coord)
 pca_coords3 <- rownames_to_column(pca_coords3, var = "PatientID")
 pca_plot_data3 <- dplyr::left_join(pca_coords3, disease_info, by = "PatientID")
 
-# Create and save PCA plot
 pca_plot_ggplot3 <- ggplot(pca_plot_data3, aes(x = Dim.1, y = Dim.2, color = Disease)) +
-  geom_point(size = 2, alpha = 0.6) +
+  geom_point(size = 2) +
   scale_color_manual(values = jama_colors) +
   labs(
     x = paste0("PC1 (", round(pca_combined$eig[1, 2], 2), "%)"),
@@ -135,53 +161,59 @@ pca_plot_ggplot3 <- ggplot(pca_plot_data3, aes(x = Dim.1, y = Dim.2, color = Dis
     axis.text = element_text(size = 8, color = "black"),
     axis.title = element_text(size = 8, color = "black")
   )
-print(pca_plot_ggplot3)
+
 ggsave("Figure2C.pdf", plot = pca_plot_ggplot3, width = 3, height = 2.5)
 
-# ==============================================================================
-# 3. Clustering and Heatmap (PCA-based)
-# ==============================================================================
 
-# 3a. Prepare data for clustering using PCA scores
-# ------------------------------------------------------------------------------
-pca_scores <- pca_cytof$ind$coord
+# ==============================================================================
+# 3. Clustering and Heatmap (based on PCA of combined data)
+# ==============================================================================
+# --NOTE-- This section uses the ComplexHeatmap package to create Figure 2D.
 
-# Determine the number of PCs to use, adjusting to prevent errors
+# --- 3a. Prepare data for clustering ---
+# Extract principal component scores from the combined PCA result
+pca_scores <- pca_combined$ind$coord
+
+# Determine the number of PCs to use for clustering
 num_pcs_to_use <- 10
 available_pcs <- ncol(pca_scores)
+# Adjust to not exceed the maximum available PCs
 if (num_pcs_to_use > available_pcs) {
   num_pcs_to_use <- available_pcs
 }
-
-# Create the clustering matrix from the selected PC scores
+# This matrix (patients as rows, PCs as columns) will be used for clustering
 clustering_matrix_B <- pca_scores[, 1:num_pcs_to_use]
 
-# 3b. Prepare data for heatmap visualization
-# ------------------------------------------------------------------------------
-clr_matrix <- cytof_data %>%
+# --- 3b. Prepare data for heatmap visualization ---
+# Apply centered log-ratio (clr) transformation to flow data for visualization
+clr_matrix <- flow_data %>%
   select(-PatientID) %>%
   acomp() %>%
   clr() %>%
   as.matrix()
-rownames(clr_matrix) <- cytof_data$PatientID
-soluble_data_imputed <- pca_input_imputed[, soluble_params]
-visualization_matrix <- cbind(clr_matrix, soluble_data_imputed)
+rownames(clr_matrix) <- flow_data$PatientID
+# Extract imputed blood data
+blood_data_imputed <- pca_input_imputed[, blood_params]
+# Combine clr-transformed flow data and imputed blood data
+visualization_matrix <- cbind(clr_matrix, blood_data_imputed)
+# Scale the combined matrix (Z-score) for visualization
 visualization_matrix_scaled <- scale(visualization_matrix)
 
-# 3c. Prepare annotations
-# ------------------------------------------------------------------------------
+# --- 3c. Prepare annotations ---
 annotation_df <- disease_info %>%
   column_to_rownames("PatientID")
+# Add an annotation for whether a patient's data was imputed
 annotation_df$Imputation <- ifelse(
-  rownames(annotation_df) %in% c("P3", "P13", "P14"),
+  rownames(annotation_df) %in% c("P03", "P21"), # Example patient IDs
   "Imputed",
   "Observed"
 )
+# Define colors for annotations
 imputation_colors <- c("Observed" = "white", "Imputed" = "gray")
 jama_colors_alpha <- scales::alpha(jama_colors, 0.6)
 imputation_colors_alpha <- scales::alpha(imputation_colors, 0.6)
 
-
+# Create the annotation object for the heatmap
 ha_combined <- HeatmapAnnotation(
   df = annotation_df,
   col = list(Disease = jama_colors_alpha, Imputation = imputation_colors_alpha),
@@ -193,53 +225,45 @@ ha_combined <- HeatmapAnnotation(
     Imputation = list(title = "Imputation", title_gp = gpar(fontsize = 8), labels_gp = gpar(fontsize = 8))
   )
 )
+# Define color function for the heatmap body
 col_fun <- colorRamp2(c(-2.5, 0, 2.5), c("dodgerblue", "white", "red"))
 
-# 3d. Draw the heatmap
-# ------------------------------------------------------------------------------
+# --- 3d. Draw the heatmaps ---
 
-# ht1: Top heatmap for patient clustering based on PCA scores
+# ht1: A hidden heatmap used ONLY to generate the patient clustering based on PCA scores.
 ht1 <- Heatmap(
-  t(clustering_matrix_B),
-  height = unit(0, "cm"),
-  rect_gp = gpar(type = "none"), 
+  t(clustering_matrix_B), # Use transposed PCA scores
+  height = unit(0, "cm"), # Make heatmap invisible
+  rect_gp = gpar(type = "none"),
   show_heatmap_legend = FALSE,
-  
   # Column (patient) clustering settings
   cluster_columns = TRUE,
-  clustering_distance_columns = "euclidean", # Use Euclidean distance, suitable for PCA coordinates
+  clustering_distance_columns = "euclidean", # Appropriate for PCA coordinates
   clustering_method_columns = "ward.D2",
-  column_split = 2,
+  column_split = 3, # Split patients into 3 clusters
   column_title = NULL,
   show_column_dend = TRUE,
   column_dend_height = unit(10, "mm"),
   top_annotation = ha_combined,
-  
-  # Row clustering (PCs) is not needed
-  cluster_rows = FALSE,
-  show_row_dend = FALSE,
-  show_row_names = FALSE
+  # Row (PC) clustering is not needed
+  cluster_rows = FALSE
 )
 
-# ht2: Main heatmap visualizing Z-scores of parameters
+# ht2: The main heatmap visualizing the Z-scores of the original parameters.
 ht2 <- Heatmap(
   t(visualization_matrix_scaled),
   name = "Z-score",
-  
   # Row (variable) clustering
   cluster_rows = TRUE,
   clustering_distance_rows = "euclidean",
   clustering_method_rows = "complete",
   show_row_names = TRUE,
-  row_split = 2,
-  row_title = NULL,
   row_names_gp = gpar(fontsize = 6),
-  row_title_gp = gpar(fontsize = 8),
-  
-  # Column clustering is FALSE to follow the order from ht1
+  row_split = 4, # Split variables into 4 clusters
+  row_title = NULL,
+  # Column (patient) clustering is inherited from ht1
   cluster_columns = FALSE,
   show_column_names = FALSE,
-  
   col = col_fun,
   heatmap_legend_param = list(
     title = "Z-score",
@@ -248,13 +272,14 @@ ht2 <- Heatmap(
   )
 )
 
-# 3e. Combine, draw, and save the heatmaps
-# ------------------------------------------------------------------------------
+# --- 3e. Combine, draw, and save the final plot ---
 ht_list <- ht1 %v% ht2
-pdf("Figure2D.pdf", width = 4.5, height = 8.5)
+pdf("Figure2D.pdf", width = 4.5, height = 8)
 draw(
   ht_list,
   heatmap_legend_side = "right",
   annotation_legend_side = "right"
 )
 dev.off()
+
+
