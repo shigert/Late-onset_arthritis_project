@@ -18,7 +18,7 @@ set.seed(123)
 # --- Load and preprocess flow cytometry data ---
 # Raw proportion data
 data <- read.csv("proportion_total.csv", header = TRUE)
-data2 <- read.csv("proportion_tcell2.csv", header = TRUE)
+data2 <- read.csv("proportion_tcell.csv", header = TRUE)
 # Remove T-cell data from the first dataframe and merge with the second
 new_data <- data[!grepl("T cell", data$Cluster), ]
 datanew <- rbind(new_data, data2)
