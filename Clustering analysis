@@ -16,7 +16,7 @@ set.seed(123)
 
 # CyTOF proportion data
 data <- read.csv("proportion_total.csv", header = TRUE)
-data2 <- read.csv("proportion_tcell2.csv", header = TRUE)
+data2 <- read.csv("proportion_tcell.csv", header = TRUE)
 new_data <- data[!grepl("T cell", data$Cluster), ]
 datanew <- rbind(new_data, data2)
 
